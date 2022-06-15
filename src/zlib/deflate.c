@@ -110,6 +110,7 @@ static const config configuration_table[10] = {
 #define RANK(f) (((f) << 1) - ((f) > 4 ? 9 : 0))
 
 #if defined __aarch64__ || defined __SSE4_2__
+#define CRC_HASH
 //Any 64-bit ARM CPU has crc32c support as both are supported since ARMv8-A.
 #ifdef __aarch64__
 
@@ -889,27 +890,59 @@ static void lm_init (deflate_state* s)
  *       -------------------------------------------------
  */
 
+/*
+ * Fast version of the longest_match function for zlib.
+ * Copyright (C) 2004-2019 Konstantin Nosov
+ * For details and updates please visit
+ * https://github.com/gildor2/fast_zlib
+ * Licensed under the BSD license. See LICENSE.txt file in the project root for full license information.
+ */
+
+/* Please retain this line */
+const char fast_lm_copyright[] = " Fast match finder for zlib, https://github.com/gildor2/fast_zlib ";
+
 __attribute__ ((always_inline)) inline static uint32_t longest_match(s, cur_match)
-deflate_state *s;
-IPos cur_match;                             /* current match */
+    deflate_state *s;
+    IPos cur_match;                             /* current match */
 {
-    uint32_t chain_length = s->max_chain_length;/* max hash chain length */
+  uint32_t chain_length = s->max_chain_length;/* max hash chain length */
     register uint8_t *scan = s->window + s->strstart; /* current string */
-    register uint8_t *match;                       /* matched string */
+    register uint8_t *match;                      /* matched string */
     register int len;                           /* length of current match */
-    int best_len = s->prev_length;              /* best match length so far */
+    int best_len = s->prev_length;              /* ignore strings, shorter or of the same length */
     int nice_match = s->nice_match;             /* stop if match long enough */
-    IPos limit = s->strstart > (IPos)MAX_DIST(s) ?
-    s->strstart - (IPos)MAX_DIST(s) : NIL;
+    int offset = 0;                             /* offset of current hash chain */
+    IPos limit_base = s->strstart > (IPos)MAX_DIST(s) ?
+        s->strstart - (IPos)MAX_DIST(s) : NIL;
+    /*?? are MAX_DIST matches allowed ?! */
+    IPos limit = limit_base;                    /* limit will be limit_base+offset */
     /* Stop when cur_match becomes <= limit. To simplify the code,
      * we prevent matches with the string of window index 0.
      */
-    Pos *prev = s->prev;
+    Bytef *match_base = s->window;              /* s->window - offset */
+    Bytef *match_base2;                         /* s->window + best_len-1 - offset */
+    /* "offset search" mode will speedup only with large chain_length; plus it is
+     * impossible for deflate_fast(), because this function does not perform
+     * INSERT_STRING() for matched strings (hash table have "holes"). deflate_fast()'s
+     * max_chain is <= 32, deflate_slow() max_chain > 64 starting from compression
+     * level 6; so - offs0_mode==true only for deflate_slow() with level >= 6)
+     */
+    int offs0_mode = chain_length < 64;         /* bool, mode with offset==0 */
+    Pos *prev = s->prev;                       /* lists of the hash chains */
     uint32_t wmask = s->w_mask;
 
-    register uint8_t *strend = s->window + s->strstart + MAX_MATCH;
-    register unsigned short scan_start = *(unsigned short*)scan;
-    register unsigned short scan_end   = *(unsigned short*)(scan+best_len-1);
+    register uint8_t *strend = s->window + s->strstart + MAX_MATCH-1;
+        /* points to last byte for maximal-length scan */
+    register unsigned short scan_start = *(unsigned short*)scan;     /* 1st 2 bytes of scan */
+    uInt scan_start32 = *(uIntf*)scan;          /* 1st 4 bytes of scan */
+    uint64_t scan_start64 = *(uint64_t*)scan;          /* 1st 4 bytes of scan */
+    register unsigned short scan_end;                      /* last byte of scan + next one */
+
+#define UPDATE_MATCH_BASE2  match_base2 = match_base+best_len-1
+#define UPDATE_SCAN_END     scan_end = *(ushf*)(scan+best_len-1)
+
+    UPDATE_MATCH_BASE2;
+    UPDATE_SCAN_END;
 
     /* The code is optimized for HASH_BITS >= 8 and MAX_MATCH-2 multiple of 16.
      * It is easy to get rid of this optimization if necessary.
@@ -925,78 +958,164 @@ IPos cur_match;                             /* current match */
      */
     if ((uint32_t)nice_match > s->lookahead) nice_match = s->lookahead;
 
-        Assert((uint64_t)s->strstart <= s->window_size-MIN_LOOKAHEAD, "need lookahead");
-
-        do {
-            Assert(cur_match < s->strstart, "no future");
-
-            /* Skip to next match if the match length cannot increase
-             * or if the match length is less than 2.  Note that the checks below
-             * for insufficient lookahead only occur occasionally for performance
-             * reasons.  Therefore uninitialized memory will be accessed, and
-             * conditional jumps will be made that depend on those values.
-             * However the length of the match is limited to the lookahead, so
-             * the output of deflate is not affected by the uninitialized values.
-             */
-            uint8_t * win = s->window;
-            int cont = 1;
-            do {
-                match = win + cur_match;
-                if (likely(*(unsigned short*)(match+best_len-1) != scan_end)) {
-                    if ((cur_match = prev[cur_match & wmask]) > limit
-                        && --chain_length != 0) {
-                        continue;
-                    }
-                    cont = 0;
-                }
-                break;
-            } while (1);
-
-            if (!cont)
-                break;
-
-            if (*(unsigned short*)match != scan_start)
-                continue;
-
-            /* It is not necessary to compare scan[2] and match[2] since they are
-             * always equal when the other bytes match, given that the hash keys
-             * are equal and that HASH_BITS >= 8. Compare 2 bytes at a time at
-             * strstart+3, +5, ... up to strstart+257. We check for insufficient
-             * lookahead only every 4th comparison; the 128th check will be made
-             * at strstart+257. If MAX_MATCH-2 is not a multiple of 8, it is
-             * necessary to put more guard bytes at the end of the window, or
-             * to check more often for insufficient lookahead.
-             */
-            scan += 2, match+=2;
-            do {
-                uint64_t sv = *(uint64_t*)(void*)scan;
-                uint64_t mv = *(uint64_t*)(void*)match;
-                uint64_t xor = sv ^ mv;
-                if (xor) {
-                    scan += __builtin_ctzll(xor) / 8;
-                    break;
-                }
-                scan += 8;
-                match += 8;
-            } while (scan < strend);
-
-            if (scan > strend)
-                scan = strend;
-
-            Assert(scan <= s->window+(uint32_t)(s->window_size-1), "wild scan");
-
-            len = MAX_MATCH - (int)(strend - scan);
-            scan = strend - MAX_MATCH;
-
-            if (len > best_len) {
-                s->match_start = cur_match;
-                best_len = len;
-                if (len >= nice_match) break;
-                scan_end = *(unsigned short*)(scan+best_len-1);
+  Assert((uint64_t)s->strstart <= s->window_size-MIN_LOOKAHEAD, "need lookahead");
+    if (best_len >= MIN_MATCH) {
+        /* We're continuing search (lazy evaluation).
+         * Note: for deflate_fast best_len is always MIN_MATCH-1 here
+         */
+        register int i;
+        IPos pos;
+        register uInt hash = 0;
+        /* Find a most distant chain starting from scan with index=1 (index=0 corresponds
+         * to cur_match). Note: we cannot use s->prev[strstart+1,...] immediately, because
+         * these strings are not yet inserted into hash table yet.
+         */
+#ifndef CRC_HASH
+        UPDATE_HASH(s, hash, &scan[1]);
+        UPDATE_HASH(s, hash, &scan[2]);
+#endif
+        //TODO: Using best_len directly would be possible with CRC_HASH, but appears to be slower
+        for (i = 3; i <= best_len; i++) {
+            UPDATE_HASH(s, hash, &scan[i]);
+            /* If we're starting with best_len >= 3, we can use offset search. */
+            pos = s->head[hash];
+            if (pos < cur_match) {
+                offset = i - 2;
+                cur_match = pos;
             }
-        } while ((cur_match = prev[cur_match & wmask]) > limit
-                 && --chain_length != 0);
-    
+        }
+        /* update variables to correspond offset */
+        limit = limit_base + offset;
+        if (cur_match <= limit) goto break_matching;
+        match_base -= offset;
+        match_base2 -= offset;
+    }
+
+#define NEXT_CHAIN \
+    cur_match = prev[cur_match & wmask]; \
+    if (cur_match <= limit) goto break_matching; \
+    if (--chain_length == 0) goto break_matching;
+
+    do {
+        /* Find a candidate for matching using hash table. Jump over hash
+         * table chain until we'll have a partial march. Doing "break" when
+         * matched, and NEXT_CHAIN to try different place.
+         */
+        if (best_len <= MIN_MATCH) {
+            /* Here we have best_len < MIN_MATCH, and this means, that
+             * offset == 0. So, we need to check only first 2 bytes of
+             * match (remaining 1 byte will be the same, because of nature of
+             * hash function)
+             */
+            for (;;) {
+                if (*(ushf*)(match_base + cur_match) == scan_start) break;
+                NEXT_CHAIN;
+            }
+        } else if (best_len > 7) {
+          /* current len > MIN_MATCH (>= 4 bytes); compare 1st 4 bytes and last 2 bytes */
+          for (;;) {
+              if (*(ushf*)(match_base2 + cur_match) == scan_end &&
+                  *(uint64_t*)(match_base + cur_match) == scan_start64) break;
+              NEXT_CHAIN;
+          }
+        } else if (best_len > MIN_MATCH) {
+            /* current len > MIN_MATCH (>= 4 bytes); compare 1st 4 bytes and last 2 bytes */
+            for (;;) {
+                if (*(ushf*)(match_base2 + cur_match) == scan_end &&
+                    *(uIntf*)(match_base + cur_match) == scan_start32) break;
+                NEXT_CHAIN;
+            }
+        }
+
+        /* Skip 1 byte */
+        match = match_base + cur_match + 1;
+        scan++;
+
+        /* Found a match candidate. Compare strings to determine its length. */
+        do {
+        } while (*(ushf*)(scan+=2) == *(ushf*)(match+=2) &&
+                 *(ushf*)(scan+=2) == *(ushf*)(match+=2) &&
+                 *(ushf*)(scan+=2) == *(ushf*)(match+=2) &&
+                 *(ushf*)(scan+=2) == *(ushf*)(match+=2) &&
+                 scan < strend);
+        /* The funny "do {}" generates better code on most compilers */
+
+        /* Here, scan <= window+strstart+257 */
+        if (*scan == *match) scan++;
+
+        len = (MAX_MATCH - 1) - (int)(strend-scan);
+        scan = strend - (MAX_MATCH-1);
+
+        if (len > best_len) {
+            /* new string is longer than previous - remember it */
+            s->match_start = cur_match - offset;
+            best_len = len;
+            if (len >= nice_match) break;
+            UPDATE_SCAN_END;
+            /* look for better string offset */
+            if (len > MIN_MATCH && cur_match - offset + len < s->strstart && !offs0_mode) {
+                /* NOTE: if deflate algorithm will perform INSERT_STRING for
+                 *   a whole scan (not for scan[0] only), can remove
+                 *   "cur_match + len < s->strstart" limitation and replace it
+                 *   with "cur_match + len < strend".
+                 */
+                IPos    pos, next_pos;
+                register int i;
+                register uInt hash;
+                Bytef* scan_end;
+
+                /* go back to offset 0 */
+                cur_match -= offset;
+                offset = 0;
+                next_pos = cur_match;
+                for (i = 0; i <= len - MIN_MATCH; i++) {
+                    pos = prev[(cur_match + i) & wmask];
+                    if (pos < next_pos) {
+                        /* this hash chain is more distant, use it */
+                        if (pos <= limit_base + i) goto break_matching;
+                        next_pos = pos;
+                        offset = i;
+                    }
+                }
+                /* Switch cur_match to next_pos chain */
+                cur_match = next_pos;
+
+                /* Try hash head at len-(MIN_MATCH-1) position to see if we could get
+                 * a better cur_match at the end of string. Using (MIN_MATCH-1) lets
+                 * us to include one more byte into hash - the byte which will be checked
+                 * in main loop now, and which allows to grow match by 1.
+                 */
+                hash = 0;
+                scan_end = scan + len - MIN_MATCH + 1;
+#ifndef CRC_HASH
+                UPDATE_HASH(s, hash, &scan_end[0]);
+                UPDATE_HASH(s, hash, &scan_end[1]);
+#endif
+                UPDATE_HASH(s, hash, &scan_end[2]);
+                pos = s->head[hash];
+                if (pos < cur_match) {
+                    offset = len - MIN_MATCH + 1;
+                    if (pos <= limit_base + offset) goto break_matching;
+                    cur_match = pos;
+                }
+
+                /* update offset-dependent vars */
+                limit = limit_base + offset;
+                match_base = s->window - offset;
+                UPDATE_MATCH_BASE2;
+                continue;
+            } else {
+                /* There's no way to change offset - simply update match_base2 for
+                 * new best_len (this is similar to what original algorithm does)
+                 */
+                UPDATE_MATCH_BASE2;
+            }
+        }
+        /* follow hash chain */
+        cur_match = prev[cur_match & wmask];
+    } while (cur_match > limit && --chain_length != 0);
+
+break_matching: /* sorry for goto's, but such code is smaller and easier to view ... */
     if ((uint32_t)best_len <= s->lookahead) return (uint32_t)best_len;
     return s->lookahead;
 }
@@ -1143,7 +1262,9 @@ deflate_state *s;
         if (s->lookahead + s->insert >= MIN_MATCH) {
             uint32_t str = s->strstart - s->insert;
             uint32_t ins_h = s->window[str];
+#ifndef CRC_HASH
             INIT_HASH(s, ins_h, &s->window[str]);
+#endif
             while (s->insert) {
                 UPDATE_HASH(s, ins_h, &s->window[str + 2]);
                 s->prev[str & s->w_mask] = s->head[ins_h];
@@ -1290,7 +1411,9 @@ static block_state deflate_fast(s, flush, put)
             } else {
                 s->strstart += s->match_length;
                 s->match_length = 0;
+#ifndef CRC_HASH
                 INIT_HASH(s, s->ins_h, &s->window[s->strstart]);
+#endif
                 /* If lookahead < MIN_MATCH, ins_h is garbage, but it does not
                  * matter since it will be recomputed at next deflate call.
                  */
